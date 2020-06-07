@@ -1,0 +1,141 @@
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveTraversable #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+module Language.Ast where
+import qualified  Data.Text as Text
+import Data.Scientific
+import Control.Monad.RWS
+import Data.Functor.Identity
+import Control.Unification
+import GHC.Generics
+import Data.Typeable
+
+data Literal =
+  LInt Integer |
+  LFloat Scientific |
+  LList [Literal]
+  deriving (Generic, Ord, Eq)
+
+instance Show Literal where
+  show (LInt i) = show i
+  show (LFloat f) = show f
+  show (LList l) = "'(" ++ unwords (map show l) ++ ")"
+
+makeClosedAlpha ''Literal
+
+data Kind =
+  KindType |
+  KindArr Kind Kind |
+  KindVar
+  deriving (Generic, Show, Eq, Ord)
+
+makeClosedAlpha ''Kind
+
+-- implement trivial Functor, Foldable and Traversable instances
+instance Functor Name where
+  fmap _ = translate
+instance Foldable Name where
+  foldr _ x _ = x
+instance Traversable Name where
+  traverse f x = pure $ translate x
+
+deriving instance Generic (UTerm t v)
+
+data Scheme b t = Forall [Name t] (GenType b t)
+  deriving (Show, Eq)
+
+-- Generic type representation.  The typevariables are needed to make
+-- this work with different libraries.  b stands for a binding of
+-- variables to a term, and t the
+-- recursion type.
+data GenType b t =
+  TypeVar (Name t) Kind |
+  TypeArr t t  |
+  TypeCon (Name t) [t] |
+  TypeApp t t |
+  TypeForall b
+  deriving (Generic, Show, Eq, Functor, Foldable, Traversable)
+
+-- | Binding of variables in an expression
+data Binding v e = Binding [(v, e)] e
+  deriving (Generic, Show)
+
+instance (Alpha e, Alpha v, Show e) => Alpha (Binding v e)
+instance (Subst t e, Subst t v) => Subst t (Binding v e)
+
+-- | Type which closes over the type variables, using the
+-- unbound-generic library.
+type ClosedTypeName = Name ClosedType
+type ClosedScheme = Scheme ClosedType
+newtype ClosedType = ClosedType (GenType (Bind [ClosedTypeName] ClosedType)
+                                 ClosedType)
+  deriving (Generic, Show)
+
+type TermName = Name TypeTerm
+type TermScheme = Scheme TypeTerm
+newtype TypeTerm = TypeTerm {unUTerm :: UTerm (GenType ()) TermName}
+  deriving (Generic, Show)
+
+instance Alpha TypeTerm
+instance Alpha (UTerm (GenType ()) TermName)
+instance Alpha (GenType () (UTerm (GenType ()) TermName))
+
+-- | use Identity for foralls, since bindings are removed
+instance Unifiable (GenType ()) where
+  zipMatch (TypeArr a1 b1) (TypeArr a2 b2) =
+    Just $ TypeArr (Right (a1, a2)) (Right (b1, b2))
+  zipMatch (TypeCon n1 as1) (TypeCon n2 as2)
+    | n1 == n2 = Just $ TypeCon (translate n1) $
+                 zipWith (\a1 a2 -> Right (a1, a2)) as1 as2
+  zipMatch (TypeApp a1 b1) (TypeApp a2 b2) =
+    Just $ TypeApp (Right (a1, a2)) (Right (b1, b2))
+  zipMatch (TypeForall _) _ = error "Cannot unify foralls"
+  zipMatch _ (TypeForall _) = error "Cannot unify foralls"
+  zipMatch (TypeVar _ _) _ = error "Cannot unify variables"
+  zipMatch _ (TypeVar _ _) = error "Cannot unify variables"
+  zipMatch _ _ = Nothing
+  
+instance Subst TypeTerm Kind
+instance Subst TypeTerm TypeTerm 
+instance Subst TypeTerm (UTerm (GenType ()) TermName)
+instance Subst TypeTerm (GenType () (UTerm (GenType ()) TermName))
+  where
+    isCoerceVar (TypeVar v _) = Just $ SubstCoerce (translate v) $ \ut ->
+      case unUTerm ut of
+        UVar _ -> Nothing
+        UTerm t -> Just t
+    isCoerceVar _ = Nothing
+
+-- data Typed a t = Typed (Type t) a
+
+data Module t = Module [Declaration t]
+
+-- | Expressions.  The t variable represent the kind of type.
+data Expr t =
+  Lit t Literal |
+  Var t Name  |
+  Lam t [Name] (Expr t) |
+  App t (Expr t) (Expr t) |
+  Let t [(Name, Expr t)] (Expr t)
+  deriving (Generic, Functor, Foldable, Traversable)
+
+exprType :: Expr t -> t
+exprType (Lit t _) = t
+exprType (Var t _) = t
+exprType (Lam t _ _) = t
+exprType (App t _ _) = t
+exprType (Let t _ _) = t
+
+instance Show (Expr t) where
+  show _ = ""
+
+data Declaration t =
+  Declaration [(Name, Expr t)]
+

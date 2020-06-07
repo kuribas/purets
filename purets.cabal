@@ -1,0 +1,37 @@
+Name:		purets
+Version: 	0.0.1
+Synopsis:	Pure time series database
+Category: 	Database
+Copyright: 	Kristof Bastiaensen (2020)
+Stability:	Unstable
+License:	GPL3
+License-file:	LICENSE
+Author:		Kristof Bastiaensen
+Maintainer:	Kristof Bastiaensen
+Bug-Reports: 	https://github.com/kuribas/purets/issues
+Build-type:	Simple
+Cabal-version:	>=1.8
+Description:  A time series database driven by a pure and total language
+
+source-repository head
+  type:		git
+  location:	https://github.com/kuribas/purets
+
+Library
+  Ghc-options: -Wall
+  Build-depends: base >= 3 && < 5,
+                 unordered-containers > 0.2,
+                 containers > 0.6.0,
+                 mtl > 2.0,                                        
+                 unbound-generics >= 0.4.0,
+                 scientific >= 0.3.6.0,
+                 text >= 1.2.4,
+                 unification-fd >= 0.10.0,
+                 dlist >= 0.8.0
+                                  
+  hs-source-dirs: src
+  Exposed-Modules:
+    Language.Ast
+    Language.TypeCheck
+    Language.TypeEnv
+
