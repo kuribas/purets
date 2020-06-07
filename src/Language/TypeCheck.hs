@@ -139,8 +139,8 @@ unPoly Nothing = do
   v <- UVar <$> freshVar
   pure (v, v)
 unPoly (Just t) = do
-  rigid <- bindTerm =<< makeRigidType t
-  fresh <- bindTerm =<< makeFreshType t
+  rigid <- bindTerm =<< makeRigidType Map.empty t
+  fresh <- bindTerm =<< makeFreshType Map.empty t
   pure (rigid, fresh)
 
 infer :: Expr (Maybe TypeTerm)  -> Infer (Expr TypeTerm)
@@ -154,7 +154,7 @@ infer (Var given name) = do
   case lookup name env of
     Nothing -> error "name not found"
     Just tp -> do
-      mono <- makeFreshType tp
+      mono <- makeFreshType Map.empty tp
       (rigid, fresh) <- unPoly given
       rigid `matchWith` mono
       pure $ Var fresh name
@@ -170,33 +170,39 @@ infer (Lam mbGiven0 name0 expr0) =
     inferLam1 :: Name -> Expr (Maybe TypeTerm) -> TypeTerm
               -> Infer (Expr TypeTerm)
     inferLam1 name expr givenType = do
-      fresh <- makeFreshType givenType
+      fresh <- makeFreshType Map.empty givenType
       splitArr name expr fresh Nothing
 
     -- | split the arrow type from outer in argument and body, and match
     -- agains the expression
     splitArr :: Name -> Expr (Maybe TypeTerm) -> TypeTerm -> Maybe TypeTerm
              -> Infer (Expr TypeTerm)
-    splitArr name expr outer inner = do
-      subExpr <- case outer of
+    splitArr name expr outer inner =
+      case outer of
         UTerm (TypeArr t1 t2) -> inferLam2 name expr inner t1 t2
-        _ -> infer expr
-
-      let subType = exprType subExpr
-      pure $ Lam (UTerm (TypeArr argType subType)) name subExpr
-
+        _ -> do t1 <- freshTerm
+                t2 <- freshTerm
+                t1 `matchWith` UTerm (TypeArr t1 t2)
+                inferLam2 name expr Nothing t1 t2
+                
     inferLam2 :: Name -> Expr (Maybe TypeTerm) -> Maybe TypeTerm -> TypeTerm
               -> TypeTerm
               -> Infer (Expr TypeTerm)
-
     -- | argument type and body type are given
     inferLam2 name expr Nothing argType returnType = do
-      extendEnv name argType $ do
+      subExpr <- extendEnv name argType $ do
         case expr of
-          Lam tp name2 expr2 -> splitArr name expr returnType tp
-          t -> infer t
+          Lam tp name2 expr2 -> splitArr name2 expr2 returnType tp
+          t -> do subExpr <- infer t
+                  let subExprType = exprType subExpr
+                  subExprType `matchWith` returnType
+                  pure subExpr
+      pure $ Lam (UTerm (TypeArr argType returnType)) name subExpr
           
-        
-
     -- | argument type, body type, and an inner type are given.
-    inferLam2 name expr (Just tp) argType returnType = _
+    inferLam2 name expr (Just tp) argType returnType = do
+      innerExpr <- inferLam1 name expr tp
+      let innerExprType = exprType innerExpr
+          outerType = UTerm (TypeArr argType returnType)
+      innerExprType `matchWith` outerType
+      pure $ innerExpr $> outerType
