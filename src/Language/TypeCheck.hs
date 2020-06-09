@@ -112,7 +112,7 @@ unPolyNextState :: UnPolyState -> UnPolyState
 unPolyNextState USRigid = USFresh
 -- alternating fresh/rigid
 unPolyNextState USFresh = USRigid
--- rigid for first level, substituation for other levels.
+-- rigid for first level, substitution for other levels.
 unPolyNextState USLambda = USReplace
 -- perform only existing substitutions
 unPolyNextState USReplace = USReplace
@@ -134,18 +134,27 @@ unPoly upState subst (UTerm (TypeForall names tp)) =
   case upState of
     USFresh -> do
       newNames <- mapM (\name -> (name,) <$> freshVar) names
-      let newSubst = foldl (\s (name,fresh) -> Map.insert name (FreeVar fresh) s)
+      let newSubst = foldl (\s (name,fresh) ->
+                              Map.insert name (FreeVar fresh) s)
                      subst newNames
       unPoly USRigid newSubst (UTerm tp)
-    USReplace -> _
+    USReplace -> do
+      let newSubst = foldl (flip Map.delete) subst names
+      fst <$> unPoly upState newSubst (UTerm tp) >>= \case
+        UTerm newTp -> pure (UTerm $ TypeForall names newTp, subst)
+        -- drop the forall if the body is a unification variable, as
+        -- it's not used in that case
+        uvar -> pure (uvar, subst)
     _ -> do
       newNames <- mapM (\name -> (name,) <$> freshName name)
                   names
       let newSubst = foldl (\s (name,fresh) -> Map.insert
                              name (RigidVar fresh) s)
                      subst newNames
-      UTerm newTp <- fst <$> unPoly upState newSubst (UTerm tp)
-      pure (UTerm (TypeForall (map snd newNames) newTp), newSubst)
+      fst <$> unPoly upState newSubst (UTerm tp) >>= \case
+        UTerm newTp -> pure (UTerm (TypeForall (map snd newNames) newTp),
+                             newSubst)
+        uvar -> pure (uvar, newSubst)
 
 withUnPoly :: UnPolyState -> TypeTerm -> (TypeTerm -> Infer a) -> Infer a
 withUnPoly upState t f = do
@@ -188,7 +197,7 @@ infer (Lit given (LInt i)) = do
   rigid `matchWith` UTerm (TypeCon (Name "int" 0) [])
   pure $ Lit fresh (LInt i)
 
-infer (Var given name) = do
+infer (Var given name) =
   lookupVarType name >>= \case 
     Nothing -> error "name not found"
     Just tp -> do
