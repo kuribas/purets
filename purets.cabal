@@ -33,5 +33,4 @@ Library
   Exposed-Modules:
     Language.Ast
     Language.TypeCheck
-    Language.TypeEnv
 

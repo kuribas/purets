@@ -7,11 +7,10 @@
 {-# LANGUAGE EmptyDataDecls #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE LambdaCase #-}
 module Language.TypeCheck where
 
 import Language.Ast
-import Language.TypeEnv
-
 import Prelude hiding (lookup)
 import Data.Maybe
 import Data.Functor
@@ -35,11 +34,22 @@ data Constraint = Match TypeTerm TypeTerm
 
 data TypeError
 
+data TypeVar = RigidVar Name
+             | FreeVar IntVar
+
+type VarTypeMap = Map.Map Name TypeTerm
+type TypeMap = Map.Map Name TypeVar
+
+data InferEnv = InferEnv
+  { varTypes :: VarTypeMap
+  , typeMap :: TypeMap }
+
 newtype Infer a =
-  Infer (ReaderT TypeEnv (WriterT (DList.DList Constraint)
-                          (Uni.IntBindingT Type (Except TypeError)))
-         a)
-  deriving (Functor, Applicative, Monad)
+  Infer { getInfer :: (ReaderT InferEnv (WriterT (DList.DList Constraint)
+                                         (Uni.IntBindingT Type
+                                          (Except TypeError)))
+                        a) }
+  deriving (Functor, Applicative, Monad, MonadReader InferEnv)
 
 liftBinding :: Uni.IntBindingT Type (Except TypeError) a -> Infer a
 liftBinding = Infer . lift . lift
@@ -52,14 +62,24 @@ addConstraint = Infer . tell . DList.singleton
 addConstraints :: [Constraint] -> Infer ()
 addConstraints = Infer . tell . DList.fromList
 
-getEnv :: Infer TypeEnv
-getEnv = Infer ask
+getVarTypeMap :: Infer VarTypeMap
+getVarTypeMap = varTypes <$> Infer ask
 
-localEnv :: (TypeEnv -> TypeEnv) -> Infer a -> Infer a
-localEnv f (Infer e) = Infer $ local f e
+getTypeMap :: Infer TypeMap
+getTypeMap = typeMap <$> Infer ask
 
-extendEnv :: Name -> TypeTerm -> Infer a -> Infer a
-extendEnv name tp = localEnv (`extend` (name, tp))
+lookupVarType :: Name -> Infer (Maybe TypeTerm)
+lookupVarType name = Infer $ asks $ Map.lookup name . varTypes
+
+lookupType :: Name -> Infer (Maybe TypeVar)
+lookupType name = Infer $ asks $ Map.lookup name . typeMap 
+
+extendVar :: Name -> TypeTerm -> Infer a -> Infer a
+extendVar name tp (Infer m) = Infer $ local extend m
+  where extend env = env { varTypes = Map.insert name tp $ varTypes env}
+
+withLocalTypeMap :: TypeMap -> Infer a -> Infer a
+withLocalTypeMap mp = local $ \env -> env { typeMap = mp }
 
 matchWith :: TypeTerm -> TypeTerm -> Infer ()
 matchWith t1 t2 = addConstraint $ Match t1 t2
@@ -79,85 +99,103 @@ bindTerm :: TypeTerm -> Infer TypeTerm
 bindTerm = fmap UVar . liftBinding . Uni.newVar
 
 -- | substitute a unique variable name or fresh variable for a type variable
-substTypeVar :: Map.Map Name (Either Name IntVar) -> Name -> Kind
-             -> Infer TypeTerm
+substTypeVar :: TypeMap -> Name -> Kind -> Infer TypeTerm
 substTypeVar subst n k = case Map.lookup n subst of
-  Just (Left name) -> pure $ UTerm $ TypeVar name k
-  Just (Right var) -> pure $ UVar var
+  Just (RigidVar name) -> pure $ UTerm $ TypeVar name k
+  Just (FreeVar var) -> pure $ UVar var
   Nothing -> pure $ UTerm $ TypeVar n k
-             
--- | Create a rigid type, by making all variables unique.  Rigid
--- variables can only match itself. It alternates with makeFreshType
--- for function inputs.  The TypeTerm should not have any bound
--- unification variables.
-makeRigidType :: Map.Map Name (Either Name IntVar) -> TypeTerm
-              -> Infer TypeTerm
-makeRigidType _ (UVar v) = pure $ UVar v
-makeRigidType subst (UTerm (TypeVar n k)) =
-  substTypeVar subst n k
-makeRigidType subst (UTerm (TypeArr t1 t2)) =
-  UTerm <$> (TypeArr <$> makeFreshType subst t1 <*> makeRigidType subst t2)
-makeRigidType _subst (UTerm (TypeCon n t)) = pure $ UTerm (TypeCon n t)
-makeRigidType subst (UTerm (TypeApp t1 t2)) = 
-  UTerm <$> (TypeApp <$> makeFreshType subst t1 <*> makeFreshType subst t2)
-makeRigidType subst (UTerm (TypeForall names tp)) = do
-  newNames <- mapM (\name -> (name,) <$> freshName name) names
-  let newSubst = foldl (\s (name,fresh) -> Map.insert name (Left fresh) s)
-                 subst newNames
-  UTerm newTp <- makeRigidType newSubst (UTerm tp)
-  pure $ UTerm (TypeForall (map snd newNames) newTp)
 
--- | Make a polymorphic type term monomorphic, by creating fresh
--- bindings for each type variable.  The term should not have any
--- bound unification variables.
-makeFreshType ::  Map.Map Name (Either Name IntVar) -> TypeTerm
-              -> Infer TypeTerm
-makeFreshType _subst (UVar v) = pure $ UVar v
-makeFreshType subst (UTerm (TypeVar n k)) =
-  substTypeVar subst n k
-makeFreshType subst (UTerm (TypeArr t1 t2)) =
-  UTerm <$> (TypeArr <$> makeRigidType subst t1 <*> makeFreshType subst t2)
-makeFreshType _subst (UTerm (TypeCon n t)) = pure $ UTerm (TypeCon n t)
-makeFreshType subst (UTerm (TypeApp t1 t2)) = 
-  UTerm <$> (TypeApp <$> makeFreshType subst t1 <*> makeFreshType subst t2)
-makeFreshType subst (UTerm (TypeForall names tp)) = do
-  newNames <- mapM (\name -> (name,) <$> freshVar) names
-  let newSubst = foldl (\s (name,fresh) -> Map.insert name (Right fresh) s)
-                 subst newNames
-  makeRigidType newSubst (UTerm tp)
+data UnPolyState = USRigid | USFresh | USLambda | USReplace
+
+unPolyNextState :: UnPolyState -> UnPolyState
+-- alternating rigid/fresh
+unPolyNextState USRigid = USFresh
+-- alternating fresh/rigid
+unPolyNextState USFresh = USRigid
+-- rigid for first level, substituation for other levels.
+unPolyNextState USLambda = USReplace
+-- perform only existing substitutions
+unPolyNextState USReplace = USReplace
+  
+unPoly :: UnPolyState -> TypeMap -> TypeTerm -> Infer (TypeTerm, TypeMap) 
+unPoly _ subst (UVar v) = pure (UVar v, subst)
+unPoly _ subst (UTerm (TypeVar n k)) =
+  (,subst) <$> substTypeVar subst n k
+unPoly upState subst (UTerm (TypeArr t1 t2)) = do
+  arg <- fst <$> unPoly (unPolyNextState upState) subst t1
+  ret <- fst <$> unPoly upState subst t2
+  pure (UTerm (TypeArr arg ret), subst)
+unPoly _ subst (UTerm (TypeCon n t)) = pure (UTerm (TypeCon n t), subst)
+unPoly upState subst (UTerm (TypeApp t1 t2)) = do
+  rigid1 <- fst <$> unPoly upState subst t1
+  rigid2 <- fst <$> unPoly upState subst t2
+  pure (UTerm (TypeApp rigid1 rigid2), subst)
+unPoly upState subst (UTerm (TypeForall names tp)) =
+  case upState of
+    USFresh -> do
+      newNames <- mapM (\name -> (name,) <$> freshVar) names
+      let newSubst = foldl (\s (name,fresh) -> Map.insert name (FreeVar fresh) s)
+                     subst newNames
+      unPoly USRigid newSubst (UTerm tp)
+    USReplace -> _
+    _ -> do
+      newNames <- mapM (\name -> (name,) <$> freshName name)
+                  names
+      let newSubst = foldl (\s (name,fresh) -> Map.insert
+                             name (RigidVar fresh) s)
+                     subst newNames
+      UTerm newTp <- fst <$> unPoly upState newSubst (UTerm tp)
+      pure (UTerm (TypeForall (map snd newNames) newTp), newSubst)
+
+withUnPoly :: UnPolyState -> TypeTerm -> (TypeTerm -> Infer a) -> Infer a
+withUnPoly upState t f = do
+  env <- getTypeMap
+  (t2, newEnv) <- unPoly upState env t
+  withLocalTypeMap newEnv (f t2)
+
+withLambdaType :: TypeTerm -> (TypeTerm -> Infer a) -> Infer a
+withLambdaType = withUnPoly USLambda
+
+withCheckedType :: TypeTerm -> (TypeTerm -> Infer a) -> Infer a
+withCheckedType = withUnPoly USRigid
+
+withInferredType :: TypeTerm -> (TypeTerm -> Infer a) -> Infer a
+withInferredType = withUnPoly USFresh
 
 -- | Run the inference monad
-runInfer :: TypeEnv -> Infer TypeTerm
+runInfer :: InferEnv -> Infer TypeTerm
          -> Either TypeError (TypeTerm, [Constraint])
 runInfer env (Infer m) =
   runExcept $ Uni.evalIntBindingT $
   fmap (second DList.toList) $
   runWriterT $ runReaderT m env
 
-unPoly :: Maybe TypeTerm -> Infer (TypeTerm, TypeTerm)
-unPoly Nothing = do
+-- | Bind type to unification variables, by instantiating polymorphic
+-- variables.  Return a term for type checking, and a term for the
+-- return type
+bindPoly :: Maybe TypeTerm -> Infer (TypeTerm, TypeTerm)
+bindPoly Nothing = do
   v <- UVar <$> freshVar
   pure (v, v)
-unPoly (Just t) = do
-  rigid <- bindTerm =<< makeRigidType Map.empty t
-  fresh <- bindTerm =<< makeFreshType Map.empty t
-  pure (rigid, fresh)
+bindPoly (Just t) = do
+  checked <- bindTerm =<< withCheckedType t pure
+  inferred <- bindTerm =<< withInferredType t pure
+  pure (checked, inferred)
 
 infer :: Expr (Maybe TypeTerm)  -> Infer (Expr TypeTerm)
 infer (Lit given (LInt i)) = do
-  (rigid, fresh) <- unPoly given
+  (rigid, fresh) <- bindPoly given
   rigid `matchWith` UTerm (TypeCon (Name "int" 0) [])
   pure $ Lit fresh (LInt i)
 
 infer (Var given name) = do
-  env <- getEnv
-  case lookup name env of
+  lookupVarType name >>= \case 
     Nothing -> error "name not found"
     Just tp -> do
-      mono <- makeFreshType Map.empty tp
-      (rigid, fresh) <- unPoly given
-      rigid `matchWith` mono
-      pure $ Var fresh name
+      mono <- withInferredType tp pure
+      (checked, inferred) <- bindPoly given
+      checked `matchWith` mono
+      pure $ Var inferred name
 
 infer (Lam mbGiven0 name0 expr0) =
   case mbGiven0 of
@@ -169,11 +207,11 @@ infer (Lam mbGiven0 name0 expr0) =
     -- only one (possibly polymorphic) type is given
     inferLam1 :: Name -> Expr (Maybe TypeTerm) -> TypeTerm
               -> Infer (Expr TypeTerm)
-    inferLam1 name expr givenType = do
-      fresh <- makeFreshType Map.empty givenType
-      splitArr name expr fresh Nothing
+    inferLam1 name expr givenType =
+      withLambdaType givenType $ \inferred ->
+      splitArr name expr inferred Nothing
 
-    -- | split the arrow type from outer in argument and body, and match
+    -- split the arrow type from outer in argument and body, and match
     -- agains the expression
     splitArr :: Name -> Expr (Maybe TypeTerm) -> TypeTerm -> Maybe TypeTerm
              -> Infer (Expr TypeTerm)
@@ -188,9 +226,9 @@ infer (Lam mbGiven0 name0 expr0) =
     inferLam2 :: Name -> Expr (Maybe TypeTerm) -> Maybe TypeTerm -> TypeTerm
               -> TypeTerm
               -> Infer (Expr TypeTerm)
-    -- | argument type and body type are given
+    -- argument type and body type are given
     inferLam2 name expr Nothing argType returnType = do
-      subExpr <- extendEnv name argType $ do
+      subExpr <- extendVar name argType $
         case expr of
           Lam tp name2 expr2 -> splitArr name2 expr2 returnType tp
           t -> do subExpr <- infer t
@@ -199,10 +237,13 @@ infer (Lam mbGiven0 name0 expr0) =
                   pure subExpr
       pure $ Lam (UTerm (TypeArr argType returnType)) name subExpr
           
-    -- | argument type, body type, and an inner type are given.
+    -- argument type, body type, and an inner type are given.
     inferLam2 name expr (Just tp) argType returnType = do
       innerExpr <- inferLam1 name expr tp
       let innerExprType = exprType innerExpr
           outerType = UTerm (TypeArr argType returnType)
       innerExprType `matchWith` outerType
       pure $ innerExpr $> outerType
+
+infer (App mbGiven expr1 expr2) = _
+  
