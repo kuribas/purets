@@ -74,16 +74,18 @@ data Expr t =
   Var t Name  |
   Lam t Name (Expr t) |
   App t (Expr t) (Expr t) |
-  Let t [(Name, Expr t)] (Expr t) |
+  SetType Name TypeTerm (Expr t)|
+  Let t Name (Expr t) (Expr t) |
   Ascr t (Expr t)
   deriving (Generic, Functor, Foldable, Traversable)
 
 exprType :: Expr t -> t
 exprType (Lit t _) = t
+exprType (SetType _ _ e) = exprType e
 exprType (Var t _) = t
 exprType (Lam t _ _) = t
 exprType (App t _ _) = t
-exprType (Let t _ _) = t
+exprType (Let t _ _ _) = t
 exprType (Ascr t _) = t
 
 instance Show (Expr t) where

@@ -12,16 +12,11 @@ module Language.TypeCheck where
 
 import Language.Ast
 import Prelude hiding (lookup)
-import Data.Maybe
 import Data.Functor
-import Data.Traversable
-import Control.Applicative
-import Data.Foldable
-import qualified Data.Text as Text
+import Data.Maybe
 import qualified Data.Map as Map
 import Control.Monad.Except
 import Control.Monad.Reader
-import Control.Monad.State.Strict
 import Control.Monad.Writer.Strict
 import Data.Bifunctor
 import qualified Control.Unification.IntVar as Uni
@@ -45,10 +40,11 @@ data InferEnv = InferEnv
   , typeMap :: TypeMap }
 
 newtype Infer a =
-  Infer { getInfer :: (ReaderT InferEnv (WriterT (DList.DList Constraint)
-                                         (Uni.IntBindingT Type
-                                          (Except TypeError)))
-                        a) }
+  Infer (ReaderT InferEnv 
+         (WriterT (DList.DList Constraint)
+           (Uni.IntBindingT Type
+             (Except TypeError)))
+          a)
   deriving (Functor, Applicative, Monad, MonadReader InferEnv)
 
 liftBinding :: Uni.IntBindingT Type (Except TypeError) a -> Infer a
@@ -98,6 +94,10 @@ freshTerm = UVar <$> freshVar
 bindTerm :: TypeTerm -> Infer TypeTerm
 bindTerm = fmap UVar . liftBinding . Uni.newVar
 
+typeVarTerm :: TypeVar -> TypeTerm
+typeVarTerm (RigidVar n) = UTerm $ TypeVar n KindVar
+typeVarTerm (FreeVar i) = UVar i
+
 -- | substitute a unique variable name or fresh variable for a type variable
 substTypeVar :: TypeMap -> Name -> Kind -> Infer TypeTerm
 substTypeVar subst n k = case Map.lookup n subst of
@@ -143,7 +143,7 @@ unPoly upState subst (UTerm (TypeForall names tp)) =
       fst <$> unPoly upState newSubst (UTerm tp) >>= \case
         UTerm newTp -> pure (UTerm $ TypeForall names newTp, subst)
         -- drop the forall if the body is a unification variable, as
-        -- it's not used in that case
+        -- it's not needed anyway in that case
         uvar -> pure (uvar, subst)
     _ -> do
       newNames <- mapM (\name -> (name,) <$> freshName name)
@@ -168,8 +168,8 @@ withLambdaType = withUnPoly USLambda
 withCheckedType :: TypeTerm -> (TypeTerm -> Infer a) -> Infer a
 withCheckedType = withUnPoly USRigid
 
-withInferredType :: TypeTerm -> (TypeTerm -> Infer a) -> Infer a
-withInferredType = withUnPoly USFresh
+inferredType :: TypeTerm -> Infer TypeTerm
+inferredType t = withUnPoly USFresh t pure
 
 -- | Run the inference monad
 runInfer :: InferEnv -> Infer TypeTerm
@@ -179,32 +179,32 @@ runInfer env (Infer m) =
   fmap (second DList.toList) $
   runWriterT $ runReaderT m env
 
--- | Bind type to unification variables, by instantiating polymorphic
--- variables.  Return a term for type checking, and a term for the
--- return type
-bindPoly :: Maybe TypeTerm -> Infer (TypeTerm, TypeTerm)
-bindPoly Nothing = do
-  v <- UVar <$> freshVar
-  pure (v, v)
-bindPoly (Just t) = do
-  checked <- bindTerm =<< withCheckedType t pure
-  inferred <- bindTerm =<< withInferredType t pure
-  pure (checked, inferred)
+inferPoly :: Maybe TypeTerm -> Infer (Expr TypeTerm) -> Infer (Expr TypeTerm)
+inferPoly Nothing inf = inf
+inferPoly (Just given) inf = withCheckedType given $ \checked -> do
+  infExpr <- inf
+  checked `matchWith` exprType infExpr
+  inferred <- inferredType given
+  pure $ infExpr $> inferred
 
 infer :: Expr (Maybe TypeTerm)  -> Infer (Expr TypeTerm)
-infer (Lit given (LInt i)) = do
-  (rigid, fresh) <- bindPoly given
-  rigid `matchWith` UTerm (TypeCon (Name "int" 0) [])
-  pure $ Lit fresh (LInt i)
+infer (Lit given (LInt i)) =
+  inferPoly given $ pure $
+  Lit (UTerm (TypeCon (Name "int" 0) [])) (LInt i)
+
+infer (Lit given (LFloat f)) =
+  inferPoly given $ pure $
+  Lit (UTerm (TypeCon (Name "float" 0) [])) (LFloat f)
+
+infer (Lit given (LList l)) =
+  inferPoly given $ do
+  t <- freshTerm
+  pure $ Lit (UTerm (TypeApp (UTerm (TypeCon (Name "list" 0) [])) t)) (LList l)
 
 infer (Var given name) =
   lookupVarType name >>= \case 
     Nothing -> error "name not found"
-    Just tp -> do
-      mono <- withInferredType tp pure
-      (checked, inferred) <- bindPoly given
-      checked `matchWith` mono
-      pure $ Var inferred name
+    Just inferred -> inferPoly given $ pure $ Var inferred name
 
 infer (Lam mbGiven0 name0 expr0) =
   case mbGiven0 of
@@ -229,8 +229,8 @@ infer (Lam mbGiven0 name0 expr0) =
         UTerm (TypeArr t1 t2) -> inferLam2 name expr inner t1 t2
         _ -> do t1 <- freshTerm
                 t2 <- freshTerm
-                t1 `matchWith` UTerm (TypeArr t1 t2)
-                inferLam2 name expr Nothing t1 t2
+                outer `matchWith` UTerm (TypeArr t1 t2)
+                inferLam2 name expr inner t1 t2
                 
     inferLam2 :: Name -> Expr (Maybe TypeTerm) -> Maybe TypeTerm -> TypeTerm
               -> TypeTerm
@@ -239,20 +239,38 @@ infer (Lam mbGiven0 name0 expr0) =
     inferLam2 name expr Nothing argType returnType = do
       subExpr <- extendVar name argType $
         case expr of
-          Lam tp name2 expr2 -> splitArr name2 expr2 returnType tp
+          Lam given name2 expr2 -> splitArr name2 expr2 returnType given
           t -> do subExpr <- infer t
                   let subExprType = exprType subExpr
-                  subExprType `matchWith` returnType
+                  returnType `matchWith` subExprType
                   pure subExpr
       pure $ Lam (UTerm (TypeArr argType returnType)) name subExpr
           
     -- argument type, body type, and an inner type are given.
-    inferLam2 name expr (Just tp) argType returnType = do
-      innerExpr <- inferLam1 name expr tp
-      let innerExprType = exprType innerExpr
-          outerType = UTerm (TypeArr argType returnType)
-      innerExprType `matchWith` outerType
+    inferLam2 name expr (Just given) argType returnType = do
+      innerExpr <- inferLam1 name expr given
+      let outerType = UTerm (TypeArr argType returnType)
+      outerType `matchWith` exprType innerExpr
       pure $ innerExpr $> outerType
 
-infer (App mbGiven expr1 expr2) = _
-  
+-- | tp should not be polymorphic
+infer (SetType name tp expr) =
+  lookupType name >>= \case
+    Nothing -> error $ "unkown type" ++ show name
+    Just tp2 -> do
+      tp `matchWith` typeVarTerm tp2
+      infer expr
+                              
+infer (App given fun args) = inferPoly given $ do
+  funInf <- infer fun
+  argsInf <- infer args
+  ret <- freshTerm
+  UTerm (TypeArr (exprType argsInf) ret) `matchWith` exprType funInf
+  pure $ App ret funInf argsInf
+
+infer (Let given name expr1 expr2) = inferPoly given $ do
+  infExpr1 <- infer expr1
+  extendVar name (fromMaybe (exprType infExpr1) (exprType expr1)) $
+    infer expr2
+      
+infer (Ascr given expr) = inferPoly given $ infer expr
