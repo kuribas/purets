@@ -1,62 +1,97 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE PatternGuards #-}
-{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE EmptyDataDecls #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FlexibleInstances #-}
 module Language.TypeCheck where
 
 import Language.Ast
+import Control.Unification.IntVar
 import Prelude hiding (lookup)
+import qualified Data.Text as Text
+import Data.Text (Text)
 import Data.Functor
 import Data.Maybe
 import qualified Data.Map as Map
 import Control.Monad.Except
 import Control.Monad.Reader
-import Control.Monad.Writer.Strict
+import Control.Monad.State.Strict
+import Data.Functor.Identity
+import Data.List (foldl')
 import Data.Bifunctor
-import qualified Control.Unification.IntVar as Uni
-import qualified Data.DList as DList
-import Control.Unification.IntVar (IntVar)
 import Control.Unification (UTerm(..))
 import qualified Control.Unification as Uni
+import qualified Control.Unification.Types as Uni
 
 data Constraint = Match TypeTerm TypeTerm
+  deriving (Show)
 
-data TypeError
+data TypeError = UnknownVar Text
+               | UnknownTypeVar Text
+               | OccursFailure IntVar TypeTerm
+               | MismatchFailure (Type TypeTerm) (Type TypeTerm)
+  deriving (Show)
 
-data TypeVar = RigidVar Name
+-- | a fresh or skolem variable for type checking
+data TypeVar = SkolemVar Name
              | FreeVar IntVar
 
+-- | A map from term variables to types.
 type VarTypeMap = Map.Map Name TypeTerm
+-- | A map from type variables to fresh or skolem variables.
 type TypeMap = Map.Map Name TypeVar
 
 data InferEnv = InferEnv
   { varTypes :: VarTypeMap
   , typeMap :: TypeMap }
 
-newtype Infer a =
-  Infer (ReaderT InferEnv 
-         (WriterT (DList.DList Constraint)
-           (Uni.IntBindingT Type
-             (Except TypeError)))
-          a)
-  deriving (Functor, Applicative, Monad, MonadReader InferEnv)
+data InferState = InferState
+  { inferConstraints :: [Constraint]
+  , inferTypeErrors :: [TypeError]
+  } deriving (Show)
 
-liftBinding :: Uni.IntBindingT Type (Except TypeError) a -> Infer a
+instance Semigroup InferState where
+  InferState c1 e1 <> InferState c2 e2 = InferState (c1 <> c2) (e1 <> e2)
+
+instance Monoid InferState where
+  mempty = InferState [] []
+
+emptyInferState :: InferState
+emptyInferState = InferState [] [] 
+
+emptyEnv :: InferEnv
+emptyEnv = InferEnv { varTypes = Map.empty
+                    , typeMap = Map.empty
+                    }
+
+-- | The Infer monad.
+newtype Infer a =
+  Infer (ReaderT InferEnv
+         (StateT InferState (IntBindingT Type Identity))
+          a)
+  deriving (Functor, Applicative, Monad)
+
+liftBinding :: IntBindingT Type Identity a -> Infer a
 liftBinding = Infer . lift . lift
 
 -- | Adding a single constraint.
 addConstraint :: Constraint -> Infer ()
-addConstraint = Infer . tell . DList.singleton
-
+addConstraint c = Infer $ modify $ \s ->
+  s {inferConstraints = c:inferConstraints s}
+  
 -- | Adding many constraints.
 addConstraints :: [Constraint] -> Infer ()
-addConstraints = Infer . tell . DList.fromList
+addConstraints cs = Infer $ modify $ \s ->
+  s {inferConstraints = cs ++ inferConstraints s}
+
+-- | Adding a single constraint.
+addTypeError :: TypeError -> Infer ()
+addTypeError e = Infer $ modify $ \s ->
+  s {inferTypeErrors = e:inferTypeErrors s}
+
 
 getVarTypeMap :: Infer VarTypeMap
 getVarTypeMap = varTypes <$> Infer ask
@@ -70,22 +105,30 @@ lookupVarType name = Infer $ asks $ Map.lookup name . varTypes
 lookupType :: Name -> Infer (Maybe TypeVar)
 lookupType name = Infer $ asks $ Map.lookup name . typeMap 
 
+-- | Evaluate the given Infer monad in an extended variable
+-- environment
 extendVar :: Name -> TypeTerm -> Infer a -> Infer a
 extendVar name tp (Infer m) = Infer $ local extend m
   where extend env = env { varTypes = Map.insert name tp $ varTypes env}
 
 withLocalTypeMap :: TypeMap -> Infer a -> Infer a
-withLocalTypeMap mp = local $ \env -> env { typeMap = mp }
+withLocalTypeMap mp (Infer inf) =
+  Infer $ local (\env -> env { typeMap = mp }) inf
 
 matchWith :: TypeTerm -> TypeTerm -> Infer ()
-matchWith t1 t2 = addConstraint $ Match t1 t2
+matchWith expected actual = do
+  r <- liftBinding $ runExceptT $ Uni.unify expected actual
+  case r of
+    Left (Uni.OccursFailure v t) -> addTypeError (OccursFailure v t)
+    Left (Uni.MismatchFailure t1 t2) -> addTypeError (MismatchFailure t1 t2)
+    Right _ -> pure ()
 
 freshName :: Name -> Infer Name
 freshName (Name s _) = do
-  Uni.IntVar i <- liftBinding Uni.freeVar
+  IntVar i <- liftBinding Uni.freeVar
   pure $ Name s i
 
-freshVar :: Infer Uni.IntVar
+freshVar :: Infer IntVar
 freshVar = liftBinding Uni.freeVar
 
 freshTerm :: Infer TypeTerm
@@ -95,28 +138,32 @@ bindTerm :: TypeTerm -> Infer TypeTerm
 bindTerm = fmap UVar . liftBinding . Uni.newVar
 
 typeVarTerm :: TypeVar -> TypeTerm
-typeVarTerm (RigidVar n) = UTerm $ TypeVar n KindVar
+typeVarTerm (SkolemVar n) = UTerm $ TypeVar n KindVar
 typeVarTerm (FreeVar i) = UVar i
 
 -- | substitute a unique variable name or fresh variable for a type variable
 substTypeVar :: TypeMap -> Name -> Kind -> Infer TypeTerm
 substTypeVar subst n k = case Map.lookup n subst of
-  Just (RigidVar name) -> pure $ UTerm $ TypeVar name k
+  Just (SkolemVar name) -> pure $ UTerm $ TypeVar name k
   Just (FreeVar var) -> pure $ UVar var
   Nothing -> pure $ UTerm $ TypeVar n k
 
-data UnPolyState = USRigid | USFresh | USLambda | USReplace
+data UnPolyState = UPSSkolem | UPSFresh | UPSLambda | UPSReplace
 
+-- | How to replace typevariables in `unPoly`.
 unPolyNextState :: UnPolyState -> UnPolyState
--- alternating rigid/fresh
-unPolyNextState USRigid = USFresh
--- alternating fresh/rigid
-unPolyNextState USFresh = USRigid
--- rigid for first level, substitution for other levels.
-unPolyNextState USLambda = USReplace
--- perform only existing substitutions
-unPolyNextState USReplace = USReplace
-  
+-- | alternating skolem/fresh
+unPolyNextState UPSSkolem = UPSFresh
+-- | alternating fresh/skolem
+unPolyNextState UPSFresh = UPSSkolem
+-- | skolem for first level, substitution for other levels.
+unPolyNextState UPSLambda = UPSReplace
+-- | perform only existing substitutions
+unPolyNextState UPSReplace = UPSReplace
+
+-- | remove polymorphic variables by replacing them with either a
+-- skolem or a logic variable (in the Infer monad).  The UnPolyState
+-- determines how to do substitution of foralls.
 unPoly :: UnPolyState -> TypeMap -> TypeTerm -> Infer (TypeTerm, TypeMap) 
 unPoly _ subst (UVar v) = pure (UVar v, subst)
 unPoly _ subst (UTerm (TypeVar n k)) =
@@ -127,85 +174,134 @@ unPoly upState subst (UTerm (TypeArr t1 t2)) = do
   pure (UTerm (TypeArr arg ret), subst)
 unPoly _ subst (UTerm (TypeCon n t)) = pure (UTerm (TypeCon n t), subst)
 unPoly upState subst (UTerm (TypeApp t1 t2)) = do
-  rigid1 <- fst <$> unPoly upState subst t1
-  rigid2 <- fst <$> unPoly upState subst t2
-  pure (UTerm (TypeApp rigid1 rigid2), subst)
+  skolem1 <- fst <$> unPoly upState subst t1
+  skolem2 <- fst <$> unPoly upState subst t2
+  pure (UTerm (TypeApp skolem1 skolem2), subst)
 unPoly upState subst (UTerm (TypeForall names tp)) =
   case upState of
-    USFresh -> do
-      newNames <- mapM (\name -> (name,) <$> freshVar) names
-      let newSubst = foldl (\s (name,fresh) ->
+    UPSFresh -> do
+      -- create a fresh variable for each name variable in the forall
+      newNames <- traverse (\name -> (name,) <$> freshVar) names
+      let newSubst = foldl' (\s (name,fresh) ->
                               Map.insert name (FreeVar fresh) s)
                      subst newNames
-      unPoly USRigid newSubst (UTerm tp)
-    USReplace -> do
-      let newSubst = foldl (flip Map.delete) subst names
-      fst <$> unPoly upState newSubst (UTerm tp) >>= \case
-        UTerm newTp -> pure (UTerm $ TypeForall names newTp, subst)
+      unPoly upState newSubst (UTerm tp)
+    UPSReplace -> do
+      let newSubst = foldl' (flip Map.delete) subst names
+      unPoly upState newSubst (UTerm tp) >>= \case
+        (UTerm newTp, _) -> pure (UTerm $ TypeForall names newTp, subst)
         -- drop the forall if the body is a unification variable, as
         -- it's not needed anyway in that case
-        uvar -> pure (uvar, subst)
+        (uvar, _) -> pure (uvar, subst)
     _ -> do
-      newNames <- mapM (\name -> (name,) <$> freshName name)
+      newNames <- traverse (\name -> (name,) <$> freshName name)
                   names
-      let newSubst = foldl (\s (name,fresh) -> Map.insert
-                             name (RigidVar fresh) s)
+      let newSubst = foldl' (\s (name,fresh) ->
+                              Map.insert name (SkolemVar fresh) s)
                      subst newNames
-      fst <$> unPoly upState newSubst (UTerm tp) >>= \case
-        UTerm newTp -> pure (UTerm (TypeForall (map snd newNames) newTp),
+      unPoly upState newSubst (UTerm tp) >>= \case
+        (UTerm newTp, _) -> pure (UTerm (TypeForall (map snd newNames) newTp),
                              newSubst)
-        uvar -> pure (uvar, newSubst)
+        (uvar, _) -> pure (uvar, newSubst)
 
+-- | create a new environment with the polymorphic variables
+-- substituted by fresh variables, then evaluate the function in the
+-- modified environment.
 withUnPoly :: UnPolyState -> TypeTerm -> (TypeTerm -> Infer a) -> Infer a
 withUnPoly upState t f = do
   env <- getTypeMap
   (t2, newEnv) <- unPoly upState env t
   withLocalTypeMap newEnv (f t2)
 
+-- | substitute polymorphic variables for checking a lambda type.
+-- This only substitutes on toplevel, and leaves polymorphic arguments
+-- alone.  Then pass the updated term to a function in a modified
+-- environment.
 withLambdaType :: TypeTerm -> (TypeTerm -> Infer a) -> Infer a
-withLambdaType = withUnPoly USLambda
+withLambdaType = withUnPoly UPSLambda
 
+-- | substitute polymorphic variables for checking a type, then pass
+-- the updated term to a function in a modified environment.
 withCheckedType :: TypeTerm -> (TypeTerm -> Infer a) -> Infer a
-withCheckedType = withUnPoly USRigid
+withCheckedType = withUnPoly UPSSkolem
 
+-- | create monomorphic version of polymorphic type, with fresh
+-- variables for inferring a type.
 inferredType :: TypeTerm -> Infer TypeTerm
-inferredType t = withUnPoly USFresh t pure
+inferredType t = withUnPoly UPSFresh t pure
 
 -- | Run the inference monad
-runInfer :: InferEnv -> Infer TypeTerm
-         -> Either TypeError (TypeTerm, [Constraint])
+runInfer :: InferEnv -> Infer a
+         -> (a, InferState)
 runInfer env (Infer m) =
-  runExcept $ Uni.evalIntBindingT $
-  fmap (second DList.toList) $
-  runWriterT $ runReaderT m env
+  runIdentity $ evalIntBindingT $ flip runStateT emptyInferState $
+  runReaderT m env
 
-inferPoly :: Maybe TypeTerm -> Infer (Expr TypeTerm) -> Infer (Expr TypeTerm)
-inferPoly Nothing inf = inf
-inferPoly (Just given) inf = withCheckedType given $ \checked -> do
+runInferApply :: InferEnv -> Infer (Expr TypeTerm)
+              -> (Expr TypeTerm, InferState)
+runInferApply env i = runInfer env $ i >>= applyExprBindings
+
+-- | apply all bindings to an expression.  If occursFailure error
+-- happens, the original expression is returned (which should likely
+-- be ignored)
+applyExprBindings :: Expr TypeTerm -> Infer (Expr TypeTerm)
+applyExprBindings expr = do
+  infExpr <- liftBinding $ runExceptT $ Uni.applyBindingsAll expr
+  case infExpr of
+    Left (Uni.OccursFailure v t) -> do
+      addTypeError (OccursFailure v t)
+      pure expr
+    Left (Uni.MismatchFailure t1 t2) -> do
+      addTypeError (MismatchFailure t1 t2)
+      pure expr
+    Right res -> pure res
+  
+-- | if the expression is a forall, return a monomorphic version with
+-- fresh variables.
+inferForall :: Infer (Expr TypeTerm) -> Infer (Expr TypeTerm)
+inferForall inf = do
+  infExpr <- inf
+  inferred <- inferredType $ exprType infExpr
+  pure $ exprSetType infExpr inferred
+  
+-- | check if the polymorphic type matches the type of the term.  Then
+-- return a monomorphic version with fresh variables. Note that inf
+-- should be monomorphic (not a forall).
+ascribePoly :: TypeTerm -> Infer (Expr TypeTerm) -> Infer (Expr TypeTerm)
+ascribePoly given inf = withCheckedType given $ \checked -> do
   infExpr <- inf
   checked `matchWith` exprType infExpr
   inferred <- inferredType given
-  pure $ infExpr $> inferred
+  pure $ exprSetType infExpr inferred
 
-infer :: Expr (Maybe TypeTerm)  -> Infer (Expr TypeTerm)
+ascribePolyMaybe :: Maybe TypeTerm -> Infer (Expr TypeTerm)
+                 -> Infer (Expr TypeTerm)
+ascribePolyMaybe Nothing inf = inf
+ascribePolyMaybe (Just given) inf = ascribePoly given inf
+
+intType, floatType :: TypeTerm
+intType = UTerm $ TypeCon (Name "int" 0) []
+floatType = UTerm $ TypeCon (Name "float" 0) []
+
+infer :: Expr (Maybe TypeTerm) -> Infer (Expr TypeTerm)
 infer (Lit given (LInt i)) =
-  inferPoly given $ pure $
-  Lit (UTerm (TypeCon (Name "int" 0) [])) (LInt i)
+  ascribePolyMaybe given $ pure $ Lit intType (LInt i)
 
 infer (Lit given (LFloat f)) =
-  inferPoly given $ pure $
-  Lit (UTerm (TypeCon (Name "float" 0) [])) (LFloat f)
+  ascribePolyMaybe given $ pure $ Lit floatType (LFloat f)
 
-infer (Lit given (LList l)) =
-  inferPoly given $ do
-  t <- freshTerm
-  pure $ Lit (UTerm (TypeApp (UTerm (TypeCon (Name "list" 0) [])) t)) (LList l)
+infer (Var given name@(Name varName _)) = do
+  varTp <- lookupVarType name
+  infExpr <- case varTp of
+    Just found -> inferredType found
+    Nothing -> do
+      addTypeError $ UnknownVar varName
+      freshTerm -- return just a fresh variable.
+  ascribePolyMaybe given $ pure $ Var infExpr name
 
-infer (Var given name) =
-  lookupVarType name >>= \case 
-    Nothing -> error "name not found"
-    Just inferred -> inferPoly given $ pure $ Var inferred name
-
+-- infering lambdas is more complicated, because we want to support
+-- polymorphic arguments, and we have different ways to assign a
+-- polymorphic type to an argument
 infer (Lam mbGiven0 name0 expr0) =
   case mbGiven0 of
     Nothing -> do t1 <- freshTerm
@@ -254,23 +350,40 @@ infer (Lam mbGiven0 name0 expr0) =
       pure $ innerExpr $> outerType
 
 -- | tp should not be polymorphic
-infer (SetType name tp expr) =
-  lookupType name >>= \case
-    Nothing -> error $ "unkown type" ++ show name
-    Just tp2 -> do
-      tp `matchWith` typeVarTerm tp2
-      infer expr
+infer (SetType name tp expr) = do
+  mbTp <- lookupType name
+  term <- case mbTp of
+    Nothing -> do
+      addTypeError $ UnknownTypeVar $ Text.pack $ show name
+      a <- freshName $ Name "a" 0
+      pure $ UTerm $ TypeForall [name] (TypeVar a KindType)
+    Just found -> pure $ typeVarTerm found
+  tp `matchWith` term
+  infer expr
                               
-infer (App given fun args) = inferPoly given $ do
+infer (App given fun args) = ascribePolyMaybe given $ do
   funInf <- infer fun
   argsInf <- infer args
   ret <- freshTerm
   UTerm (TypeArr (exprType argsInf) ret) `matchWith` exprType funInf
   pure $ App ret funInf argsInf
 
-infer (Let given name expr1 expr2) = inferPoly given $ do
+infer (Let given name expr1 expr2) = ascribePolyMaybe given $ do
   infExpr1 <- infer expr1
   extendVar name (fromMaybe (exprType infExpr1) (exprType expr1)) $
     infer expr2
       
-infer (Ascr given expr) = inferPoly given $ infer expr
+infer (Ascr given expr) = ascribePolyMaybe given $ infer expr
+
+inferModule :: TypeMap
+            -> Module (Maybe TypeTerm)
+            -> (Module TypeTerm, InferState)
+inferModule globalTypes (Module decls) =
+  let inferDecl :: Declaration (Maybe TypeTerm)
+                -> ([Declaration TypeTerm], InferState)
+      inferDecl (Declaration name tp expr) =
+        runInfer (InferEnv Map.empty globalTypes) $ do
+        checkedExpr <- ascribePoly tp $ infer expr
+        appliedExpr <- applyExprBindings $ exprSetType checkedExpr tp
+        pure $ [Declaration name tp appliedExpr]
+  in first Module $ foldMap inferDecl decls

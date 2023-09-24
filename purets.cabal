@@ -27,10 +27,22 @@ Library
                  scientific >= 0.3.6.0,
                  text >= 1.2.4,
                  unification-fd >= 0.10.0,
-                 dlist >= 0.8.0
+                 dlist >= 0.8.0,
+                 megaparsec >= 8.0
                                   
   hs-source-dirs: src
   Exposed-Modules:
     Language.Ast
     Language.TypeCheck
+    Language.IntBinding
 
+test-suite test
+  type: exitcode-stdio-1.0
+  hs-source-dirs:
+    tests
+  main-is:
+    test.hs
+  build-depends:
+    purets == 0.0.1,
+    base >= 4 && < 5,
+    hspec >= 2.10.10
